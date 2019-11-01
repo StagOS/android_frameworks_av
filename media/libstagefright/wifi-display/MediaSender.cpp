@@ -30,7 +30,9 @@
 #include <media/stagefright/foundation/ABuffer.h>
 #include <media/stagefright/foundation/ADebug.h>
 #include <media/stagefright/foundation/AMessage.h>
-#include <media/stagefright/foundation/ANetworkSession.h>
+#include <media/stagefright/ANetworkSession.h>
+#include <media/stagefright/MediaBuffer.h>
+#include <media/stagefright/MediaBufferBase.h>
 #include <ui/GraphicBuffer.h>
 
 namespace android {
