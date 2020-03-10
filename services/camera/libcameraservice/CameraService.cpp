@@ -1,3 +1,4 @@
+
 /*
  * Copyright (C) 2008 The Android Open Source Project
  *
@@ -537,7 +538,6 @@ Status CameraService::getCameraCharacteristics(const String16& cameraId,
                                 String8(cameraId).string());
 
     }
-
     Status ret{};
     status_t res = mCameraProviderManager->getCameraCharacteristics(
             String8(cameraId).string(), cameraInfo);
