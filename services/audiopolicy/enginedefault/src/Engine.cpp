@@ -52,7 +52,7 @@ static const std::vector<legacy_strategy_map>& getLegacyStrategy() {
         { "STRATEGY_ENFORCED_AUDIBLE", STRATEGY_ENFORCED_AUDIBLE },
         { "STRATEGY_TRANSMITTED_THROUGH_SPEAKER", STRATEGY_TRANSMITTED_THROUGH_SPEAKER },
         { "STRATEGY_ACCESSIBILITY", STRATEGY_ACCESSIBILITY },
-        { "STRATEGY_REROUTING", STRATEGY_REROUTING },
+        //{ "STRATEGY_REROUTING", STRATEGY_REROUTING },
         { "STRATEGY_PATCH", STRATEGY_REROUTING }, // boiler to manage stream patch volume
         { "STRATEGY_CALL_ASSISTANT", STRATEGY_CALL_ASSISTANT },
     };
@@ -259,6 +259,10 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
                     AUDIO_DEVICE_OUT_LINE, AUDIO_DEVICE_OUT_USB_HEADSET,
                     AUDIO_DEVICE_OUT_USB_DEVICE});
             if (!devices.isEmpty()) break;
+            if (getDpConnAndAllowedForVoice() && isInCall()) {
+                devices = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_AUX_DIGITAL);
+                if (!devices.isEmpty()) break;
+            }
             if (!isInCall()) {
                 devices = availableOutputDevices.getFirstDevicesFromTypes({
                         AUDIO_DEVICE_OUT_USB_ACCESSORY, AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET,
@@ -434,6 +438,7 @@ DeviceVector Engine::getDevicesForStrategyInt(legacy_strategy strategy,
             devices2 = availableOutputDevices.getDevicesFromType(AUDIO_DEVICE_OUT_AUX_DIGITAL);
         }
         if ((devices2.isEmpty()) &&
+                (strategy != STRATEGY_SONIFICATION) &&
                 (getForceUse(AUDIO_POLICY_FORCE_FOR_DOCK) == AUDIO_POLICY_FORCE_ANALOG_DOCK)) {
             devices2 = availableOutputDevices.getDevicesFromType(
                     AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET);

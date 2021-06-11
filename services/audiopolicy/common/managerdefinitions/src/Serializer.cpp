@@ -29,12 +29,15 @@
 #include <utils/StrongPointer.h>
 #include <utils/Errors.h>
 #include <utils/RefBase.h>
+#include <cutils/properties.h>
 #include "Serializer.h"
 #include "TypeConverter.h"
 
 namespace android {
 
 namespace {
+
+static bool forceDisableA2dpOffload = false;
 
 // TODO(mnaganov): Consider finding an alternative for using HIDL code.
 using hardware::Return;
@@ -318,7 +321,7 @@ status_t deserializeCollection(const xmlNode *cur,
                         return status;
                     }
                 } else {
-                    return BAD_VALUE;
+                    ALOGE("Ignoring...");
                 }
             }
         }
@@ -539,6 +542,17 @@ Return<DevicePortTraits::Element> DevicePortTraits::deserialize(const xmlNode *c
     return deviceDesc;
 }
 
+char* trim(char * s) {
+    int l = strlen(s);
+
+    if (l > 0) {
+      while (isspace(s[l - 1])) --l;
+      while (*s && isspace(*s)) ++s, --l;
+    }
+
+    return strndup(s, l);
+}
+
 Return<RouteTraits::Element> RouteTraits::deserialize(const xmlNode *cur, PtrSerializingCtx ctx)
 {
     std::string type = getXmlAttribute(cur, Attributes::type);
@@ -579,8 +593,11 @@ Return<RouteTraits::Element> RouteTraits::deserialize(const xmlNode *cur, PtrSer
         if (strlen(devTag) != 0) {
             sp<PolicyAudioPort> source = ctx->findPortByTagName(devTag);
             if (source == NULL) {
-                ALOGE("%s: no source found with name=%s", __func__, devTag);
-                return Status::fromStatusT(BAD_VALUE);
+                source = ctx->findPortByTagName(trim(devTag));
+                if (source == NULL) {
+                    ALOGE("%s: no source found with name=%s", __func__, devTag);
+                    return Status::fromStatusT(BAD_VALUE);
+                }
             }
             sources.add(source);
         }
@@ -594,6 +611,98 @@ Return<RouteTraits::Element> RouteTraits::deserialize(const xmlNode *cur, PtrSer
     }
     route->setSources(sources);
     return route;
+}
+
+static void fixupQualcommBtScoRoute(RouteTraits::Collection& routes, DevicePortTraits::Collection& devicePorts, HwModule* ctx) {
+    // On many Qualcomm devices, there is a BT SCO Headset Mic => primary input mix
+    // But Telephony Rx => BT SCO Headset route is missing
+    // When we detect such case, add the missing route
+
+    // If we have:
+    // <route type="mix" sink="Telephony Tx" sources="voice_tx"/>
+    // <route type="mix" sink="primary input" sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic"/>
+    // <devicePort tagName="BT SCO Headset" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET" role="sink" />
+    // And no <route type="mix" sink="BT SCO Headset" />
+
+    // Add:
+    // <route type="mix" sink="BT SCO Headset" sources="primary output,deep_buffer,compressed_offload,Telephony Rx"/>
+    bool foundBtScoHeadsetDevice = false;
+    for(const auto& device: devicePorts) {
+        if(device->getTagName() == "BT SCO Headset") {
+            foundBtScoHeadsetDevice = true;
+            break;
+        }
+    }
+    if(!foundBtScoHeadsetDevice) {
+        ALOGE("No BT SCO Headset device found, don't patch policy");
+        return;
+    }
+
+    bool foundTelephony = false;
+    bool foundBtScoInput = false;
+    bool foundScoHeadsetRoute = false;
+    for(const auto& route: routes) {
+        ALOGE("Looking at route %d\n", route->getType());
+        if(route->getType() != AUDIO_ROUTE_MIX)
+            continue;
+        auto sink = route->getSink();
+        ALOGE("... With sink %s\n", sink->getTagName().c_str());
+        if(sink->getTagName() == "Telephony Tx") {
+            foundTelephony = true;
+            continue;
+        }
+        if(sink->getTagName() == "BT SCO Headset") {
+            foundScoHeadsetRoute = true;
+            break;
+        }
+        for(const auto& source: route->getSources()) {
+            ALOGE("... With source %s\n", source->getTagName().c_str());
+            if(source->getTagName() == "BT SCO Headset Mic") {
+                foundBtScoInput = true;
+                break;
+            }
+        }
+    }
+    //The route we want to add is already there
+    ALOGE("Done looking for existing routes");
+    if(foundScoHeadsetRoute)
+        return;
+
+    ALOGE("No existing route found... %d %d", foundTelephony ? 1 : 0, foundBtScoInput ? 1 : 0);
+    //We couldn't find the routes we assume are required for the function we want to add
+    if(!foundTelephony || !foundBtScoInput)
+        return;
+    ALOGE("Adding our own.");
+
+    // Add:
+    // <route type="mix" sink="BT SCO Headset" sources="primary output,deep_buffer,compressed_offload,Telephony Rx"/>
+    AudioRoute *newRoute = new AudioRoute(AUDIO_ROUTE_MIX);
+
+    auto sink = ctx->findPortByTagName("BT SCO Headset");
+    ALOGE("Got sink %p\n", sink.get());
+    newRoute->setSink(sink);
+
+    Vector<sp<PolicyAudioPort>> sources;
+    for(const auto& sourceName: {
+            "primary output",
+            "deep_buffer",
+            "compressed_offload",
+            "Telephony Rx"
+            }) {
+        auto source = ctx->findPortByTagName(sourceName);
+        ALOGE("Got source %p\n", source.get());
+        if (source.get() != nullptr) {
+            sources.add(source);
+            source->addRoute(newRoute);
+        }
+    }
+
+    newRoute->setSources(sources);
+
+    sink->addRoute(newRoute);
+
+    auto ret = routes.add(newRoute);
+    ALOGE("route add returned %zd", ret);
 }
 
 Return<ModuleTraits::Element> ModuleTraits::deserialize(const xmlNode *cur, PtrSerializingCtx ctx)
@@ -615,11 +724,33 @@ Return<ModuleTraits::Element> ModuleTraits::deserialize(const xmlNode *cur, PtrS
 
     Element module = new HwModule(name.c_str(), versionMajor, versionMinor);
 
+    bool isA2dpModule = strcmp(name.c_str(), "a2dp") == 0;
+    bool isPrimaryModule = strcmp(name.c_str(), "primary") == 0;
+
     // Deserialize childrens: Audio Mix Port, Audio Device Ports (Source/Sink), Audio Routes
     MixPortTraits::Collection mixPorts;
     status_t status = deserializeCollection<MixPortTraits>(cur, &mixPorts, NULL);
     if (status != NO_ERROR) {
         return Status::fromStatusT(status);
+    }
+    if(forceDisableA2dpOffload && isA2dpModule) {
+        for(const auto& mixPort: mixPorts) {
+            ALOGE("Disable a2dp offload...? %s", mixPort->getTagName().c_str());
+            //"a2dp" sw module already has a2dp out
+            if(mixPort->getTagName() == "a2dp output") {
+                forceDisableA2dpOffload = false;
+                break;
+            }
+        }
+    }
+    if(forceDisableA2dpOffload && isA2dpModule) {
+        //Add
+        //<mixPort name="a2dp output" role="source"/>
+        auto mixPort = new IOProfile("a2dp output", AUDIO_PORT_ROLE_SOURCE);
+        AudioProfileTraits::Collection profiles;
+        profiles.add(AudioProfile::createFullDynamic());
+        mixPort->setAudioProfiles(profiles);
+        mixPorts.push_back(mixPort);
     }
     module->setProfiles(mixPorts);
 
@@ -628,6 +759,90 @@ Return<ModuleTraits::Element> ModuleTraits::deserialize(const xmlNode *cur, PtrS
     if (status != NO_ERROR) {
         return Status::fromStatusT(status);
     }
+    Vector<std::string> a2dpOuts;
+    a2dpOuts.push_back("BT A2DP Out");
+    a2dpOuts.push_back("BT A2DP Headphones");
+    a2dpOuts.push_back("BT A2DP Speaker");
+    if(forceDisableA2dpOffload) {
+        if(isA2dpModule) {
+            //<devicePort tagName="BT A2DP Out" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP" role="sink" address="lhdc_a2dp">
+            //  <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+            //      samplingRates="44100,48000,96000"
+            //      channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+            //</devicePort>
+            if(true) {
+                FormatVector formats;
+                //auto devicePortOut = new DeviceDescriptor(AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, formats, "BT A2DP Out");
+                auto devicePortOut = new DeviceDescriptor(AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, "BT A2DP Out");
+                AudioProfileTraits::Collection profiles;
+                ChannelTraits::Collection channels;
+                channels.insert(AUDIO_CHANNEL_OUT_STEREO);
+                SampleRateSet sampleRates;
+                sampleRates.insert(44100);
+                sampleRates.insert(48000);
+                sampleRates.insert(96000);
+                auto profile = new AudioProfile(AUDIO_FORMAT_PCM_16_BIT, channels, sampleRates);
+                profiles.add(profile);
+                devicePortOut->setAudioProfiles(profiles);
+                devicePortOut->setAddress("lhdc_a2dp");
+                devicePorts.add(devicePortOut);
+            }
+            //<devicePort tagName="BT A2DP Headphones" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES" role="sink" address="lhdc_a2dp">
+            //  <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+            //      samplingRates="44100,48000,96000"
+            //      channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+            //</devicePort>
+            if(true) {
+                FormatVector formats;
+                auto devicePortOut = new DeviceDescriptor(AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES, "BT A2DP Headphones");
+                AudioProfileTraits::Collection profiles;
+                ChannelTraits::Collection channels;
+                channels.insert(AUDIO_CHANNEL_OUT_STEREO);
+                SampleRateSet sampleRates;
+                sampleRates.insert(44100);
+                sampleRates.insert(48000);
+                sampleRates.insert(96000);
+                auto profile = new AudioProfile(AUDIO_FORMAT_PCM_16_BIT, channels, sampleRates);
+                profiles.add(profile);
+                devicePortOut->setAudioProfiles(profiles);
+                devicePortOut->setAddress("lhdc_a2dp");
+                devicePorts.add(devicePortOut);
+            }
+            //<devicePort tagName="BT A2DP Speaker" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER" role="sink" address="lhdc_a2dp">
+            //  <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+            //      samplingRates="44100,48000,96000"
+            //      channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+            //</devicePort>
+            if(true) {
+                FormatVector formats;
+                auto devicePortOut = new DeviceDescriptor(AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER, "BT A2DP Speaker");
+                AudioProfileTraits::Collection profiles;
+                ChannelTraits::Collection channels;
+                channels.insert(AUDIO_CHANNEL_OUT_STEREO);
+                SampleRateSet sampleRates;
+                sampleRates.insert(44100);
+                sampleRates.insert(48000);
+                sampleRates.insert(96000);
+                auto profile = new AudioProfile(AUDIO_FORMAT_PCM_16_BIT, channels, sampleRates);
+                profiles.add(profile);
+                devicePortOut->setAudioProfiles(profiles);
+                devicePortOut->setAddress("lhdc_a2dp");
+                devicePorts.add(devicePortOut);
+
+            }
+        } else if(isPrimaryModule) {
+            for(const auto& out: a2dpOuts) {
+                auto iterA = std::find_if(devicePorts.begin(), devicePorts.end(), [out](const auto port) {
+                        if(port->getTagName() == out) return true;
+                        return false;
+                        });
+                if(iterA != devicePorts.end()) {
+                    ALOGE("Erasing device port %s", (*iterA)->getTagName().c_str());
+                    devicePorts.erase(iterA);
+                }
+            }
+        }
+    }
     module->setDeclaredDevices(devicePorts);
 
     RouteTraits::Collection routes;
@@ -635,6 +850,76 @@ Return<ModuleTraits::Element> ModuleTraits::deserialize(const xmlNode *cur, PtrS
     if (status != NO_ERROR) {
         return Status::fromStatusT(status);
     }
+    if(forceDisableA2dpOffload) {
+        if(strcmp(name.c_str(), "primary") == 0) {
+            for(const auto& out: a2dpOuts) {
+                auto iterA = std::find_if(routes.begin(), routes.end(), [out](const auto route) {
+                        if(route->getType() != AUDIO_ROUTE_MIX)
+                        return false;
+                        auto sink = route->getSink();
+                        if(sink->getTagName() == out) {
+                            return true;
+                        }
+                        return false;
+                });
+                if(iterA != routes.end()) {
+                    auto sink = (*iterA)->getSink()->getTagName();
+                    ALOGE("Erasing route %s", sink.c_str());
+                    routes.erase(iterA);
+                }
+            }
+        } else if(isA2dpModule) {
+            //<route type="mix" sink="BT A2DP Out"
+            //  sources="a2dp output"/>
+            if(true) {
+                auto newRoute = new AudioRoute(AUDIO_ROUTE_MIX);
+                auto sink = module->findPortByTagName("BT A2DP Out");
+                auto source = module->findPortByTagName("a2dp output");
+                newRoute->setSink(sink);
+                Vector<sp<PolicyAudioPort>> sources;
+                sources.add(source);
+
+                sink->addRoute(newRoute);
+                source->addRoute(newRoute);
+                newRoute->setSources(sources);
+
+                routes.add(newRoute);
+            }
+            //<route type="mix" sink="BT A2DP Headphones"
+            //  sources="a2dp output"/>
+            if(true) {
+                auto newRoute = new AudioRoute(AUDIO_ROUTE_MIX);
+                auto sink = module->findPortByTagName("BT A2DP Headphones");
+                auto source = module->findPortByTagName("a2dp output");
+                newRoute->setSink(sink);
+                Vector<sp<PolicyAudioPort>> sources;
+                sources.add(source);
+
+                sink->addRoute(newRoute);
+                source->addRoute(newRoute);
+                newRoute->setSources(sources);
+                routes.add(newRoute);
+            }
+            //<route type="mix" sink="BT A2DP Speaker"
+            //  sources="a2dp output"/>
+            if(true) {
+                auto newRoute = new AudioRoute(AUDIO_ROUTE_MIX);
+                auto sink = module->findPortByTagName("BT A2DP Speaker");
+                auto source = module->findPortByTagName("a2dp output");
+                newRoute->setSink(sink);
+                Vector<sp<PolicyAudioPort>> sources;
+                sources.add(source);
+
+                sink->addRoute(newRoute);
+                source->addRoute(newRoute);
+                newRoute->setSources(sources);
+                routes.add(newRoute);
+            }
+        }
+    }
+    ALOGE("Good morning");
+    fixupQualcommBtScoRoute(routes, devicePorts, module.get());
+    ALOGE("Good morning2");
     module->setRoutes(routes);
 
     for (const xmlNode *children = cur->xmlChildrenNode; children != NULL;
@@ -804,6 +1089,7 @@ status_t PolicySerializer::deserialize(const char *configFile, AudioPolicyConfig
 status_t deserializeAudioPolicyFile(const char *fileName, AudioPolicyConfig *config)
 {
     PolicySerializer serializer;
+    forceDisableA2dpOffload = property_get_bool("persist.sys.phh.disable_a2dp_offload", false);
     return serializer.deserialize(fileName, config);
 }
 

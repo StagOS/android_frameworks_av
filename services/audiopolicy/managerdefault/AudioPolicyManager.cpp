@@ -93,6 +93,8 @@ bool operator!= (const SortedVector<T> &left, const SortedVector<T> &right)
     return !(left == right);
 }
 
+static bool forceDisableA2dpOffload = false;
+
 // ----------------------------------------------------------------------------
 // AudioPolicyInterface implementation
 // ----------------------------------------------------------------------------
@@ -4462,6 +4464,7 @@ static status_t deserializeAudioPolicyXmlConfig(AudioPolicyConfig &config) {
     } else if (property_get_bool("persist.bluetooth.bluetooth_audio_hal.disabled", false)) {
         fileNames.push_back(AUDIO_POLICY_BLUETOOTH_LEGACY_HAL_XML_CONFIG_FILE_NAME);
     }
+    forceDisableA2dpOffload = property_get_bool("persist.sys.phh.disable_a2dp_offload", false);
     fileNames.push_back(AUDIO_POLICY_XML_CONFIG_FILE_NAME);
 
     for (const char* fileName : fileNames) {
@@ -5240,7 +5243,7 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
     DeviceVector oldDevices = mEngine->getOutputDevicesForAttributes(attr, 0, true /*fromCache*/);
     DeviceVector newDevices = mEngine->getOutputDevicesForAttributes(attr, 0, false /*fromCache*/);
 
-    SortedVector<audio_io_handle_t> srcOutputs = getOutputsForDevices(oldDevices, mPreviousOutputs);
+    SortedVector<audio_io_handle_t> srcOutputs = getOutputsForDevices(oldDevices, mOutputs);
     SortedVector<audio_io_handle_t> dstOutputs = getOutputsForDevices(newDevices, mOutputs);
 
     uint32_t maxLatency = 0;
