@@ -3291,6 +3291,7 @@ status_t CameraService::BasicClient::startCameraOps() {
     sCameraService->updateOpenCloseStatus(mCameraIdStr, true/*open*/, mClientPackageName);
 #ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
     gVendorCameraProviderService->setPackageName(String8(mClientPackageName).string());
+    ALOGI("%s: Client Package name is = %s", __FUNCTION__, String8(mClientPackageName).string());
 #endif
     return OK;
 }
