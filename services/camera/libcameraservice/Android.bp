@@ -39,7 +39,6 @@ cc_library_shared {
     name: "libcameraservice",
     defaults: [
         "camera_needs_client_info_lib_defaults",
-        "qti_camera_device_defaults",
         "needs_camera_boottime_defaults",
         "no_cameraserver_defaults",
     ],
@@ -157,6 +156,7 @@ cc_library_shared {
         "android.hardware.camera.provider@2.6",
         "android.hardware.camera.provider@2.7",
         "android.hardware.camera.device@1.0",
+        "vendor.qti.hardware.camera.device@1.0",
         "android.hardware.camera.device@3.2",
         "android.hardware.camera.device@3.3",
         "android.hardware.camera.device@3.4",
